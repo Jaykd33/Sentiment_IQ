@@ -1,0 +1,32 @@
+# ── Python ────────────────────────────────────────────────────────
+Backend/venv/
+Backend/__pycache__/
+Backend/**/__pycache__/
+Backend/**/*.pyc
+Backend/**/*.pyo
+
+# ── Large model weight files ──────────────────────────────────────
+**/*.safetensors
+**/*.bin
+**/*.pt
+**/*.pth
+**/*.pkl
+**/*.ckpt
+
+# ── All checkpoint folders ────────────────────────────────────────
+Backend/transformer/
+
+# ── Training output images (optional, saves space) ────────────────
+Backend/outputs/
+Backend/__results___files/
+Backend/__huggingface_repos__.json
+
+# ── Node ──────────────────────────────────────────────────────────
+Frontend/sentimentiq/node_modules/
+Frontend/sentimentiq/.next/
+Frontend/sentimentiq/.vercel/
+
+# ── OS ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log

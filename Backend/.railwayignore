@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+outputs/baseline_cm.png
+outputs/baseline_f1.png
+outputs/eda_distributions.png
+outputs/emotion_analysis.png
+outputs/helpfulness_insights.png
+outputs/lr_coefficients.png
+outputs/shap_contributions.png
+outputs/top_words.png
+outputs/transformer_cm.png
+outputs/wordclouds.png
+transformer/checkpoints/
+__results___files/
