@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 
-// In development, calls your local FastAPI at port 8000.
-// In production (Vercel), calls your deployed Railway/Render backend.
-// Set BACKEND_URL in your Vercel environment variables for production.
 const BACKEND_URL = process.env.BACKEND_URL || 'http://127.0.0.1:8000'
+
+export const maxDuration = 60  // Allow up to 60s for Render cold start (Vercel Pro)
+                                // On free Vercel this cap is 10s — see note below
 
 export async function POST(req: NextRequest) {
   try {
@@ -13,26 +13,55 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Missing or invalid text' }, { status: 400 })
     }
 
-    const res = await fetch(`${BACKEND_URL}/predict`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    })
+    const controller = new AbortController()
+    // 55 second timeout — gives Render time to wake from sleep
+    const timeoutId  = setTimeout(() => controller.abort(), 55000)
+
+    let res: Response
+    try {
+      res = await fetch(`${BACKEND_URL}/predict`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ text }),
+        signal:  controller.signal,
+      })
+    } catch (fetchErr: any) {
+      clearTimeout(timeoutId)
+      if (fetchErr.name === 'AbortError') {
+        return NextResponse.json(
+          { error: 'The AI backend is waking up from sleep (Render free tier). Please wait 30 seconds and try again.' },
+          { status: 503 }
+        )
+      }
+      return NextResponse.json(
+        { error: 'Could not reach the inference backend. Is it deployed?' },
+        { status: 503 }
+      )
+    }
+
+    clearTimeout(timeoutId)
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
-      return NextResponse.json({ error: err.error || 'Backend error' }, { status: 500 })
+      // If backend says models still loading, give friendly message
+      if (res.status === 503) {
+        return NextResponse.json(
+          { error: 'Models are still loading on the backend. Please retry in 20 seconds.' },
+          { status: 503 }
+        )
+      }
+      return NextResponse.json(
+        { error: (err as any).detail || 'Backend error' },
+        { status: res.status }
+      )
     }
 
     const data = await res.json()
     return NextResponse.json(data)
+
   } catch (err: any) {
     console.error('Proxy error:', err)
-    // Fallback: if backend is unreachable, return a helpful error
-    return NextResponse.json(
-      { error: 'Could not reach inference backend. Is the FastAPI server running?' },
-      { status: 503 }
-    )
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
 

@@ -1,57 +1,114 @@
 # SENTIMENT_IQ/Backend/main.py
 
-import os, re, time, pickle, io
+import os, re, time, pickle, logging
 import numpy as np
 from pathlib import Path
-from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 from huggingface_hub import hf_hub_download
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-# Set these as environment variables in Railway dashboard
-HF_USERNAME      = os.environ.get("HF_USERNAME", "YOUR_HF_USERNAME")
-BERT_REPO        = f"{HF_USERNAME}/sentimentiq-distilbert"
-SKLEARN_REPO     = f"{HF_USERNAME}/sentimentiq-sklearn"
-DEVICE           = "cuda" if torch.cuda.is_available() else "cpu"
-CLASS_NAMES      = ["negative", "neutral", "positive"]
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
-print(f"Device: {DEVICE}")
-print(f"Loading DistilBERT from HuggingFace: {BERT_REPO}")
+# ── Config ────────────────────────────────────────────────────────────────────
+HF_USERNAME  = os.environ.get("HF_USERNAME", "YOUR_HF_USERNAME")
+BERT_REPO    = f"{HF_USERNAME}/sentimentiq-distilbert"
+SKLEARN_REPO = f"{HF_USERNAME}/sentimentiq-sklearn"
+DEVICE       = "cpu"   # Render free tier is CPU-only
+CLASS_NAMES  = ["negative", "neutral", "positive"]
 
-# ── Load DistilBERT (downloads and caches automatically) ──────────────────────
-tokenizer  = AutoTokenizer.from_pretrained(BERT_REPO)
-bert_model = AutoModelForSequenceClassification.from_pretrained(BERT_REPO)
-bert_model.eval()
-bert_model.to(DEVICE)
-print("DistilBERT loaded.")
+# ── Global model holders ──────────────────────────────────────────────────────
+# Models are loaded once at startup via the lifespan handler
+models = {
+    "tokenizer":    None,
+    "bert":         None,
+    "emotion_pipe": None,
+    "lr_pipeline":  None,
+    "ready":        False,
+}
 
-# ── Load sklearn LR pipeline from HuggingFace ─────────────────────────────────
-print("Downloading logistic regression pipeline...")
-lr_path = hf_hub_download(
-    repo_id=SKLEARN_REPO,
-    filename="logistic_regression_pipeline.pkl",
-    repo_type="dataset",
+# ── Lifespan: load all models when server starts ──────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load models at startup, clean up on shutdown."""
+    log.info("=== SentimentIQ Backend Starting ===")
+    log.info(f"Device       : {DEVICE}")
+    log.info(f"HF repo      : {BERT_REPO}")
+
+    try:
+        # 1. DistilBERT tokenizer + model
+        log.info("Loading DistilBERT tokenizer...")
+        models["tokenizer"] = AutoTokenizer.from_pretrained(BERT_REPO)
+
+        log.info("Loading DistilBERT model weights...")
+        models["bert"] = AutoModelForSequenceClassification.from_pretrained(
+            BERT_REPO,
+            torch_dtype=torch.float32,   # float32 for CPU stability
+        )
+        models["bert"].eval()
+        log.info("DistilBERT ready.")
+
+        # 2. Sklearn LR pipeline
+        log.info("Downloading LR pipeline from HuggingFace...")
+        lr_path = hf_hub_download(
+            repo_id=SKLEARN_REPO,
+            filename="logistic_regression_pipeline.pkl",
+            repo_type="dataset",
+        )
+        with open(lr_path, "rb") as f:
+            models["lr_pipeline"] = pickle.load(f)
+        log.info("LR pipeline ready.")
+
+        # 3. Emotion model (downloads from HuggingFace Hub automatically)
+        log.info("Loading emotion model (j-hartmann/emotion-english-distilroberta-base)...")
+        models["emotion_pipe"] = pipeline(
+            "text-classification",
+            model="j-hartmann/emotion-english-distilroberta-base",
+            top_k=None,
+            device=-1,           # -1 = CPU
+            truncation=True,
+            max_length=512,
+        )
+        log.info("Emotion model ready.")
+
+        models["ready"] = True
+        log.info("=== All models loaded. Server ready. ===")
+
+    except Exception as e:
+        log.error(f"Model loading failed: {e}")
+        # Don't crash the server — /health will report not ready
+        models["ready"] = False
+
+    yield   # Server runs here
+
+    # Cleanup on shutdown
+    log.info("Shutting down SentimentIQ backend.")
+
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="SentimentIQ API",
+    version="2.0.0",
+    description="Emotion-aware Amazon review sentiment analysis",
+    lifespan=lifespan,
 )
-with open(lr_path, "rb") as f:
-    lr_pipeline = pickle.load(f)
-print("LR pipeline loaded.")
 
-# ── Load emotion model ────────────────────────────────────────────────────────
-print("Loading emotion model...")
-emotion_pipe = pipeline(
-    "text-classification",
-    model="j-hartmann/emotion-english-distilroberta-base",
-    top_k=None,
-    device=0 if torch.cuda.is_available() else -1,
-    truncation=True,
-    max_length=512,
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
-print("Emotion model loaded.")
 
-# ── Label maps & metadata ──────────────────────────────────────────────────────
+# ── Request model ─────────────────────────────────────────────────────────────
+class ReviewRequest(BaseModel):
+    text: str
+
+# ── Label maps ────────────────────────────────────────────────────────────────
 EMOTION_META = {
     "joy":         {"emoji": "😊", "valence":  1.00},
     "anger":       {"emoji": "😠", "valence": -0.90},
@@ -85,19 +142,7 @@ NARRATIVES = {
     "neutral-surprise":     "Reviewer is on the fence but something caught them off guard.",
 }
 
-# ── FastAPI ───────────────────────────────────────────────────────────────────
-app = FastAPI(title="SentimentIQ API", version="2.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class ReviewRequest(BaseModel):
-    text: str
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Inference helpers ─────────────────────────────────────────────────────────
 def uppercase_ratio(text: str) -> float:
     alpha = [c for c in text if c.isalpha()]
     if not alpha: return 0.0
@@ -105,10 +150,11 @@ def uppercase_ratio(text: str) -> float:
 
 @torch.no_grad()
 def run_sentiment(text: str) -> dict:
-    enc  = tokenizer(text, return_tensors="pt", truncation=True,
-                     max_length=128, padding=True).to(DEVICE)
-    out  = bert_model(**enc)
-    prob = torch.softmax(out.logits, dim=-1).squeeze().cpu().numpy()
+    tok  = models["tokenizer"]
+    mdl  = models["bert"]
+    enc  = tok(text, return_tensors="pt", truncation=True, max_length=128, padding=True)
+    out  = mdl(**enc)
+    prob = torch.softmax(out.logits, dim=-1).squeeze().numpy()
     pid  = int(np.argmax(prob))
     return {
         "label":         CLASS_NAMES[pid],
@@ -119,7 +165,7 @@ def run_sentiment(text: str) -> dict:
 
 def run_emotion(text: str) -> dict:
     EMOTIONS = list(EMOTION_META.keys())
-    raw      = emotion_pipe(text[:512])[0]
+    raw      = models["emotion_pipe"](text[:512])[0]
     scores   = {e: 0.0 for e in EMOTIONS}
     for item in raw:
         mapped = RAW_LABEL_MAP.get(item["label"].lower(), "neutral")
@@ -141,16 +187,14 @@ def run_helpfulness(text: str, sentiment: str) -> dict:
     has_contrast = bool(re.search(r"\b(but|however|although|though|despite|except)\b", text.lower()))
     has_exclaim  = text.count("!") > 2
     upr          = uppercase_ratio(text)
-
-    score = 0.40
-    score += min(word_count / 200, 0.25)
-    if has_numbers:  score += 0.10
-    if has_contrast: score += 0.10
-    if has_exclaim:  score -= 0.05
-    if upr > 0.15:   score -= 0.05
+    score        = 0.40
+    score       += min(word_count / 200, 0.25)
+    if has_numbers:           score += 0.10
+    if has_contrast:          score += 0.10
+    if has_exclaim:           score -= 0.05
+    if upr > 0.15:            score -= 0.05
     if sentiment == "neutral": score += 0.05
-    score = float(np.clip(score, 0.0, 1.0))
-
+    score    = float(np.clip(score, 0.0, 1.0))
     tendency = "high" if score >= 0.70 else "medium" if score >= 0.45 else "low"
     hlabel   = {"high":"🟢 Likely Helpful","medium":"🟡 Moderately Helpful","low":"🔴 Unlikely Helpful"}[tendency]
     return {
@@ -171,7 +215,7 @@ def get_top_tokens(text: str) -> list:
            "slow","avoid","refund","return","damage","broke","fail","failed"}
     tokens, seen, result = [], set(), []
     for w in re.findall(r"\b[a-z]{3,}\b", text.lower()):
-        if w in POS: tokens.append({"token":w,"score": 1.2,"direction":"positive"})
+        if   w in POS: tokens.append({"token":w,"score": 1.2,"direction":"positive"})
         elif w in NEG: tokens.append({"token":w,"score":-1.5,"direction":"negative"})
     for t in sorted(tokens, key=lambda x: abs(x["score"]), reverse=True):
         if t["token"] not in seen:
@@ -187,17 +231,30 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "device": DEVICE}
+    """Render uses this to check if the service is up."""
+    return {
+        "status":  "healthy" if models["ready"] else "loading",
+        "ready":   models["ready"],
+        "device":  DEVICE,
+        "version": "2.0.0",
+    }
 
 @app.post("/predict")
 def predict(req: ReviewRequest):
-    if not req.text or len(req.text.strip()) < 5:
-        return {"error": "Text too short (min 5 chars)"}
-    if len(req.text) > 5000:
-        return {"error": "Text too long (max 5000 chars)"}
+    # Guard: reject requests if models aren't loaded yet
+    if not models["ready"]:
+        raise HTTPException(
+            status_code=503,
+            detail="Models are still loading. Please retry in 30 seconds.",
+        )
+
+    text = req.text.strip()
+    if len(text) < 5:
+        raise HTTPException(status_code=400, detail="Text too short (min 5 chars)")
+    if len(text) > 5000:
+        raise HTTPException(status_code=400, detail="Text too long (max 5000 chars)")
 
     t0          = time.time()
-    text        = req.text.strip()
     sentiment   = run_sentiment(text)
     emotion     = run_emotion(text)
     helpfulness = run_helpfulness(text, sentiment["label"])
@@ -211,6 +268,8 @@ def predict(req: ReviewRequest):
         f"{sentiment['label']}-{emotion['dominant_emotion']}",
         f"{emotion['emoji']} Reviewer expresses {emotion['dominant_emotion']}.",
     )
+
+    log.info(f"Predicted: {sentiment['label']} | {emotion['dominant_emotion']} | {round(time.time()-t0,2)}s")
 
     return {
         "sentiment":      sentiment["label"],
