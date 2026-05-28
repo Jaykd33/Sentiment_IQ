@@ -62,7 +62,6 @@ async def lifespan(app: FastAPI):
         models["bert"] = AutoModelForSequenceClassification.from_pretrained(
             BERT_REPO,
             torch_dtype=torch.float32,
-            low_cpu_mem_usage=True,      # stream weights, reduces peak RAM
         )
         models["bert"].eval()
         log.info("DistilBERT ready.")
@@ -368,6 +367,77 @@ async def predict(req: ReviewRequest):
     t0          = time.time()
     sentiment   = run_sentiment(text)
     emotion     = await run_emotion(text)       # async — calls HF API
+    helpfulness = run_helpfulness(text, sentiment["label"])
+    top_tokens  = get_top_tokens(text)
+
+    sv_map    = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
+    alignment = 1 - abs(emotion["valence_score"] - sv_map[sentiment["label"]]) / 2
+    adj_conf  = round(sentiment["confidence"] * (0.70 + 0.30 * alignment), 4)
+
+    narrative = NARRATIVES.get(
+        f"{sentiment['label']}-{emotion['dominant_emotion']}",
+        f"{emotion['emoji']} Reviewer expresses {emotion['dominant_emotion']}.",
+    )
+
+    elapsed = round((time.time() - t0) * 1000, 1)
+    log.info(
+        f"[{sentiment['label'].upper()}] {emotion['dominant_emotion']} | "
+        f"conf={sentiment['confidence']:.3f} | {elapsed}ms | "
+        f"emotion_src={emotion.get('source','?')}"
+    )
+
+    return {
+        "sentiment":      sentiment["label"],
+        "confidence":     sentiment["confidence"],
+        "adj_confidence": adj_conf,
+        "probabilities":  sentiment["probabilities"],
+        "emotion":        emotion["dominant_emotion"],
+        "emotion_emoji":  emotion["emoji"],
+        "valence":        emotion["valence_score"],
+        "helpfulness":    helpfulness,
+        "narrative":      narrative,
+        "top_tokens":     top_tokens,
+        "processing_ms":  elapsed,
+    }
+
+# REPLACE your existing routes section with this:
+
+@app.api_route("/", methods=["GET", "HEAD"])
+def root():
+    return {
+        "status":  "ok",
+        "model":   "SentimentIQ v2",
+        "version": "2.1.0",
+        "emotion": "HuggingFace Inference API",
+    }
+
+@app.api_route("/health", methods=["GET", "HEAD"])
+def health():
+    return {
+        "status":       "healthy" if models["ready"] else "loading",
+        "ready":        models["ready"],
+        "device":       DEVICE,
+        "version":      "2.1.0",
+        "emotion_mode": "hf_api" if HF_API_TOKEN else "rule_based",
+    }
+
+@app.post("/predict")
+async def predict(req: ReviewRequest):
+    if not models["ready"]:
+        raise HTTPException(
+            status_code=503,
+            detail="Models are still loading. Please retry in 30 seconds.",
+        )
+
+    text = req.text.strip()
+    if len(text) < 5:
+        raise HTTPException(status_code=400, detail="Text too short (min 5 chars)")
+    if len(text) > 5000:
+        raise HTTPException(status_code=400, detail="Text too long (max 5000 chars)")
+
+    t0          = time.time()
+    sentiment   = run_sentiment(text)
+    emotion     = await run_emotion(text)
     helpfulness = run_helpfulness(text, sentiment["label"])
     top_tokens  = get_top_tokens(text)
 
